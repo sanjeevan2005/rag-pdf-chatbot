@@ -1,128 +1,92 @@
+# app.py
+
 import streamlit as st
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
+import requests
+from htmlTemplates import css, bot_template, user_template  # Custom styles & templates
 
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# from langchain_huggingface import HuggingFaceEmbeddings  # Optional alternative embeddings
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from htmlTemplates import css, bot_template, user_template
+# URL of your FastAPI backend
+BACKEND_URL = "http://127.0.0.1:8000"
 
+# --- User-Bot Interaction Handler --- #
+def handle_user_input(question: str):
+    session_id = st.session_state.session_id
+    data = {"session_id": session_id, "user_question": question}
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-    return text
+    # Show user question
+    st.session_state.chat_history.append({"type": "user", "content": question})
+    st.write(user_template.replace("{{MSG}}", question), unsafe_allow_html=True)
 
+    with st.spinner("Thinking..."):
+        try:
+            response = requests.post(f"{BACKEND_URL}/chat", data=data)
+            if response.status_code == 200:
+                result = response.json()
+                answer = result.get("answer", "Sorry, I don't have an answer.")
+                sources = result.get("source_documents", [])
 
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_text(text)
-    return chunks
+                # Show bot response
+                st.session_state.chat_history.append({"type": "bot", "content": answer})
+                st.write(bot_template.replace("{{MSG}}", answer), unsafe_allow_html=True)
 
+                # Show source documents if available
+                if sources:
+                    with st.expander("Show sources"):
+                        for i, doc in enumerate(sources):
+                            st.markdown(f"**Chunk {i+1}:**")
+                            st.write(doc['page_content'])
 
-def get_vectorstore(text_chunks):
-    embeddings = OpenAIEmbeddings()  # Use OpenAI embeddings
-    # embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")  # Uncomment if needed
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-    return vectorstore
+            else:
+                st.error(f"Request failed: {response.status_code} - {response.text}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Backend error: {e}")
 
-
-def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI()
-
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"  
-    )
-
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory,
-        return_source_documents=True,
-        output_key="answer"  # still required here too
-    )
-
-    return conversation_chain
-
-
-
-def handle_user_input(user_question):
-    response = st.session_state.conversation({"question": user_question})
-
-    answer = response.get("answer", "")
-    source_docs = response.get("source_documents", [])
-    st.session_state.chat_history = response.get('chat_history', [])
-
-    for message in st.session_state.chat_history:
-        if message.type == "human":
-            st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-        elif message.type == "ai":
-            st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-
-    # Remove duplicate rendering of the same bot answer
-    # Now just display the source documents
-    if source_docs:
-        with st.expander("Show source text used for the answer"):
-            for i, doc in enumerate(source_docs):
-                st.markdown(f"**Chunk {i+1}:**")
-                st.write(doc.page_content)
-
-
-
+# --- Streamlit App Layout --- #
 def main():
-    load_dotenv()
-    st.set_page_config(page_title="Chat with multiple PDFs", page_icon=":books:")
+    st.set_page_config(page_title="PDF Chatbot", page_icon="📚")
+    st.title("Chat with PDFs 📚")
 
-    st.write(css, unsafe_allow_html=True)  # Load custom CSS for styling
+    # Inject custom CSS
+    st.write(css, unsafe_allow_html=True)
 
-    # Maintain state across Streamlit reruns
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-
+    # Initialize session state
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    st.header("Chat with multiple PDFs :books:")
+    # Display chat history
+    for msg in st.session_state.chat_history:
+        template = user_template if msg["type"] == "user" else bot_template
+        st.write(template.replace("{{MSG}}", msg["content"]), unsafe_allow_html=True)
 
-    user_question = st.text_input("Enter your question here:")
-    if user_question and st.session_state.conversation:
-        handle_user_input(user_question)
+    # User question input
+    user_input = st.chat_input("Ask a question about your PDFs...")
+    if user_input and st.session_state.session_id:
+        handle_user_input(user_input)
 
+    # Sidebar: PDF upload
     with st.sidebar:
-        st.subheader("Your PDFs")
-        pdf_docs = st.file_uploader("Upload your PDFs here and click on 'Process'", accept_multiple_files=True)
+        st.subheader("Upload your PDFs")
+        pdfs = st.file_uploader("Select PDF files", type=["pdf"], accept_multiple_files=True)
 
-        if st.button("Process PDFs") and pdf_docs:
-            with st.spinner("Processing PDFs..."):
-                # Extract text from PDFs
-                raw_text = get_pdf_text(pdf_docs)
+        if st.button("Process PDFs"):
+            if pdfs:
+                with st.spinner("Processing..."):
+                    files = [("files", (pdf.name, pdf.getvalue(), pdf.type)) for pdf in pdfs]
+                    try:
+                        res = requests.post(f"{BACKEND_URL}/process-pdfs", files=files)
+                        if res.status_code == 200:
+                            result = res.json()
+                            st.session_state.session_id = result["session_id"]
+                            st.session_state.chat_history = []
+                            st.success("PDFs processed! Ask your questions below.")
+                        else:
+                            st.error(f"Failed to process PDFs: {res.text}")
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"Connection error: {e}")
+            else:
+                st.warning("Please upload at least one PDF file.")
 
-                # Chunk the text
-                text_chunks = get_text_chunks(raw_text)
-
-                # Create vector store
-                vectorstore = get_vectorstore(text_chunks)
-
-                # Create conversation chain
-                st.session_state.conversation = get_conversation_chain(vectorstore)
-
-                st.success("PDFs processed successfully!")
-
-
+# Run the app
 if __name__ == "__main__":
     main()
